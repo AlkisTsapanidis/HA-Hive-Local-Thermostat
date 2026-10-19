@@ -377,10 +377,13 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Check and correct boost remaining heat if necessary."""
         if reported_boost_remaining_heat > BOOST_ERROR:
             # Calculate remaining boost time based on when it started
-            if self.heat_boost_started and self.heat_boost_started_duration > 0:
+            tracked = bool(
+                self.heat_boost_started and self.heat_boost_started_duration > 0
+            )
+            if tracked and self.heat_boost_started:
                 elapsed = (utcnow() - self.heat_boost_started).total_seconds() / 60
-                self.heat_boost_remaining = int(
-                    self.heat_boost_started_duration - elapsed
+                self.heat_boost_remaining = max(
+                    0, int(self.heat_boost_started_duration - elapsed)
                 )
             else:
                 self.heat_boost_remaining = 0
@@ -391,12 +394,21 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.heat_boost_remaining,
             )
             if self.config_entry is not None:
-                self.config_entry.async_create_task(
-                    self.hass,
-                    self.async_heating_boost(
-                        self.heat_boost_remaining, reported_boost_temperature
-                    ),
-                )
+                if tracked and self.heat_boost_remaining == 0:
+                    # Boost has run its course; re-issuing it would extend it
+                    self.config_entry.async_create_task(
+                        self.hass, self.async_heating_boost_cancel()
+                    )
+                else:
+                    # Unknown remaining time (e.g. restart mid-boost) falls back
+                    # to the configured duration
+                    self.config_entry.async_create_task(
+                        self.hass,
+                        self.async_heating_boost(
+                            self.heat_boost_remaining or None,
+                            reported_boost_temperature,
+                        ),
+                    )
             return True
         self.heat_boost_remaining = reported_boost_remaining_heat
         return False
@@ -405,10 +417,13 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Check and correct boost remaining water if necessary."""
         if reported_boost_remaining_water > BOOST_ERROR:
             # Calculate remaining boost time based on when it started
-            if self.water_boost_started and self.water_boost_started_duration > 0:
+            tracked = bool(
+                self.water_boost_started and self.water_boost_started_duration > 0
+            )
+            if tracked and self.water_boost_started:
                 elapsed = (utcnow() - self.water_boost_started).total_seconds() / 60
-                self.water_boost_remaining = int(
-                    self.water_boost_started_duration - elapsed
+                self.water_boost_remaining = max(
+                    0, int(self.water_boost_started_duration - elapsed)
                 )
             else:
                 self.water_boost_remaining = 0
@@ -419,9 +434,15 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.water_boost_remaining,
             )
             if self.config_entry is not None:
-                self.config_entry.async_create_task(
-                    self.hass, self.async_water_boost(self.water_boost_remaining)
-                )
+                if tracked and self.water_boost_remaining == 0:
+                    self.config_entry.async_create_task(
+                        self.hass, self.async_water_boost_cancel()
+                    )
+                else:
+                    self.config_entry.async_create_task(
+                        self.hass,
+                        self.async_water_boost(self.water_boost_remaining or None),
+                    )
             return True
         self.water_boost_remaining = reported_boost_remaining_water
         return False
@@ -470,7 +491,8 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> None:
         """Send water boost command."""
 
-        self.pre_boost_water_mode = self.water_mode
+        if not self.water_boost:
+            self.pre_boost_water_mode = self.water_mode
 
         duration = str(int(boost_duration_minutes or self.water_boost_duration))
         payload = (
@@ -520,8 +542,11 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> None:
         """Send heating boost command."""
 
-        self.pre_boost_occupied_heating_setpoint_heat = self.target_temperature
-        self.pre_boost_hvac_mode = self.hvac_mode
+        # Only capture state when not already boosting, otherwise (extending or
+        # correcting a boost) we would overwrite it with the boosted values
+        if not self.heat_boost:
+            self.pre_boost_occupied_heating_setpoint_heat = self.target_temperature
+            self.pre_boost_hvac_mode = self.hvac_mode
 
         duration = str(int(boost_duration_minutes or self.heating_boost_duration))
         temperature = str(boost_temperature or self.heating_boost_temperature)
@@ -552,9 +577,6 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_heating_boost_cancel(self) -> None:
         """Cancel heating boost command."""
 
-    async def async_heating_boost_cancel(self) -> None:
-        """Cancel heating boost command."""
-
         if self.pre_boost_hvac_mode == HVACMode.AUTO:
             if self.model == MODEL_SLR2:
                 await self._async_publish_set(r'{"system_mode_heat":"heat","temperature_setpoint_hold_heat":0}')
@@ -569,6 +591,8 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self.model == MODEL_SLR2:
                 await self._async_publish_set(r'{"system_mode_heat":"off","temperature_setpoint_hold_heat":0}')
             else:
+                # Cancelling a boost in the SLR1 while the system is in manual mode actually reverts to the schedule.
+                # This basically maintains that behaviour for consistency. I cannot verify what the SLR2 does.
                 await self._async_publish_set(r'{"system_mode":"heat","temperature_setpoint_hold":0}')
 
     async def async_set_temperature(self, temperature: float) -> None:
