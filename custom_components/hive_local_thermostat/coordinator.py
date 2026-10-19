@@ -47,6 +47,8 @@ class ZoneKeys:
     hold: str
     hold_duration: str
     setpoint: str = ""  # unused for water, which has no setpoint attribute
+    local_temperature: str = ""
+    running_state: str = ""
 
 
 # SLR1/OTR1 expose a single heating zone with unsuffixed attribute names
@@ -55,6 +57,8 @@ HEAT_KEYS_SINGLE = ZoneKeys(
     hold="temperature_setpoint_hold",
     hold_duration="temperature_setpoint_hold_duration",
     setpoint="occupied_heating_setpoint",
+    local_temperature="local_temperature",
+    running_state="running_state",
 )
 # SLR2 suffixes its attributes per zone
 HEAT_KEYS_SLR2 = ZoneKeys(
@@ -62,11 +66,14 @@ HEAT_KEYS_SLR2 = ZoneKeys(
     hold="temperature_setpoint_hold_heat",
     hold_duration="temperature_setpoint_hold_duration_heat",
     setpoint="occupied_heating_setpoint_heat",
+    local_temperature="local_temperature_heat",
+    running_state="running_state_heat",
 )
 WATER_KEYS_SLR2 = ZoneKeys(
     mode="system_mode_water",
     hold="temperature_setpoint_hold_water",
     hold_duration="temperature_setpoint_hold_duration_water",
+    running_state="running_state_water",
 )
 
 
@@ -188,7 +195,7 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     @callback
-    def handle_mqtt_message(self, message: ReceiveMessage) -> None:  # noqa: C901, PLR0912, PLR0915
+    def handle_mqtt_message(self, message: ReceiveMessage) -> None:
         """Handle received MQTT message."""
         topic = message.topic
         payload = message.payload
@@ -218,160 +225,12 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if not self.valid_data_for_model(parsed_data):
                 return
 
+            reported_boost_remaining_heat, reported_boost_temperature = (
+                self._parse_heating(parsed_data)
+            )
+            reported_boost_remaining_water = 0
             if self.model == MODEL_SLR2:
-                reported_boost_remaining_heat = cast(
-                    int,
-                    parsed_data["temperature_setpoint_hold_duration_heat"]
-                    if parsed_data["system_mode_heat"] == "emergency_heating"
-                    else 0,
-                )
-                reported_boost_remaining_water = cast(
-                    int,
-                    parsed_data["temperature_setpoint_hold_duration_water"]
-                    if parsed_data["system_mode_water"] == "emergency_heating"
-                    else 0,
-                )
-                reported_boost_temperature = parsed_data[
-                    "occupied_heating_setpoint_heat"
-                ]
-                self.running_state_heat = cast(
-                    str,
-                    parsed_data.get("running_state_heat")
-                    if parsed_data.get("running_state_heat")
-                    else "preheating",
-                )
-                self.running_state_water = cast(
-                    str,
-                    parsed_data.get("running_state_water")
-                    if parsed_data.get("running_state_water")
-                    else "preheating",
-                )
-                self.current_temperature = parsed_data["local_temperature_heat"]
-                if parsed_data["occupied_heating_setpoint_heat"] == 1:
-                    self.target_temperature = self.heating_frost_prevention
-                else:
-                    self.target_temperature = parsed_data[
-                        "occupied_heating_setpoint_heat"
-                    ]
-                # When user-set OFF, the device reports the frost-protection setpoint.
-                # Restore the pre-off temperature so HA displays and resumes correctly.
-                if self._user_set_off and self._pre_off_temperature is not None:
-                    self.target_temperature = self._pre_off_temperature
-
-                # Guard against SLR2 schedule-transition race condition.
-                # When the SLR2 transitions schedule periods it emits a burst of MQTT
-                # messages. The genuine new setpoint arrives with hold=False; stale
-                # echoes of the prior period's setpoint arrive with hold=True.
-                # Strategy: track the last hold=False setpoint as the authoritative
-                # target, and suppress any hold=True message that differs from it.
-                # This catches echoes at any temperature (7°C frost, 19°C prior
-                # setpoint, etc.) not just frost-level values.
-                # Skip suppression when the user intentionally set OFF via HA —
-                # that command also uses hold=True and must not be overridden.
-                if parsed_data.get("temperature_setpoint_hold_heat") is False:
-                    # Genuine schedule setpoint — record it as the authoritative target.
-                    self._last_schedule_setpoint = self.target_temperature
-                elif (
-                    not self._user_set_off
-                    and parsed_data.get("temperature_setpoint_hold_heat") is True
-                    and self._last_schedule_setpoint is not None
-                    and self.target_temperature != self._last_schedule_setpoint
-                ):
-                    LOGGER.warning(
-                        "Suppressing stale setpoint echo during schedule transition "
-                        "(ignoring %.1f°C, retaining %.1f°C)",
-                        self.target_temperature,
-                        self._last_schedule_setpoint,
-                    )
-                    self.target_temperature = self._last_schedule_setpoint
-
-                self.preset_mode = self.climate_preset(parsed_data["system_mode_heat"])
-                if parsed_data["system_mode_heat"] == "auto":
-                    self.hvac_mode = HVACMode.AUTO
-                if parsed_data["system_mode_heat"] == "heat":
-                    if (
-                        parsed_data["temperature_setpoint_hold_heat"] is False
-                        and self.show_heating_schedule_mode
-                    ):
-                        self.hvac_mode = HVACMode.AUTO
-                    else:
-                        self.hvac_mode = HVACMode.HEAT
-                if parsed_data["system_mode_heat"] == "emergency_heating":
-                    self.hvac_mode = HVACMode.HEAT
-                    self.heat_boost = True
-                if parsed_data["system_mode_heat"] == "off":
-                    self.hvac_mode = HVACMode.OFF
-                if self._user_set_off:
-                    self.hvac_mode = HVACMode.OFF
-
-                if (
-                    parsed_data["system_mode_heat"] != "emergency_heating"
-                    and self.hvac_mode != HVACMode.OFF
-                ):
-                    self.pre_boost_occupied_heating_setpoint_heat = (
-                        self.target_temperature
-                    )
-                    self.pre_boost_hvac_mode = self.hvac_mode
-                if parsed_data["system_mode_water"] == "auto":
-                    self.water_mode = "auto"
-                if parsed_data["system_mode_water"] == "heat":
-                    if parsed_data["temperature_setpoint_hold_water"] is False:
-                        if self.show_water_schedule_mode:
-                            self.water_mode = "auto"
-                        else:
-                            self.water_mode = "heat"
-                    else:
-                        self.water_mode = "heat"
-                if parsed_data["system_mode_water"] == "emergency_heating":
-                    self.water_mode = "boost"
-                    self.water_boost = True
-                if parsed_data["system_mode_water"] == "off":
-                    self.water_mode = "off"
-
-                if parsed_data["system_mode_water"] != "emergency_heating":
-                    self.pre_boost_water_mode = self.water_mode
-            else:
-                reported_boost_remaining_heat = cast(
-                    int,
-                    parsed_data["temperature_setpoint_hold_duration"]
-                    if parsed_data["system_mode"] == "emergency_heating"
-                    else 0,
-                )
-                reported_boost_temperature = parsed_data["occupied_heating_setpoint"]
-                self.running_state_heat = cast(
-                    str,
-                    parsed_data.get("running_state")
-                    if parsed_data.get("running_state")
-                    else "preheating",
-                )
-                self.current_temperature = parsed_data["local_temperature"]
-                if parsed_data["occupied_heating_setpoint"] == 1:
-                    self.target_temperature = self.heating_frost_prevention
-                else:
-                    self.target_temperature = parsed_data["occupied_heating_setpoint"]
-                self.preset_mode = self.climate_preset(parsed_data["system_mode"])
-
-                if parsed_data["system_mode"] == "auto":
-                    self.hvac_mode = HVACMode.AUTO
-                if parsed_data["system_mode"] == "heat":
-                    if (
-                        parsed_data["temperature_setpoint_hold"] is False
-                        and self.show_heating_schedule_mode
-                    ):
-                        self.hvac_mode = HVACMode.AUTO
-                    else:
-                        self.hvac_mode = HVACMode.HEAT
-                if parsed_data["system_mode"] == "emergency_heating":
-                    self.hvac_mode = HVACMode.HEAT
-                    self.heat_boost = True
-                if parsed_data["system_mode"] == "off":
-                    self.hvac_mode = HVACMode.OFF
-
-                if parsed_data["system_mode"] != "emergency_heating":
-                    self.pre_boost_occupied_heating_setpoint_heat = (
-                        self.target_temperature
-                    )
-                    self.pre_boost_hvac_mode = self.hvac_mode
+                reported_boost_remaining_water = self._parse_water(parsed_data)
 
             if self.correct_heat_boost(
                 reported_boost_remaining_heat, reported_boost_temperature
@@ -389,6 +248,114 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             LOGGER.error("Failed to parse JSON from MQTT payload: %s", payload)
         except Exception as err:  # noqa: BLE001
             LOGGER.error("Error handling MQTT message: %s", err)
+
+    def _parse_heating(self, data: dict[str, Any]) -> tuple[int, float]:
+        """Update heating state from a payload, returning boost remaining and setpoint."""
+        k = self.heat_keys
+        is_slr2 = self.model == MODEL_SLR2
+        mode = data[k.mode]
+
+        remaining = cast(
+            int, data[k.hold_duration] if mode == "emergency_heating" else 0
+        )
+        reported_setpoint = data[k.setpoint]
+        self.running_state_heat = cast(str, data.get(k.running_state) or "preheating")
+        self.current_temperature = data[k.local_temperature]
+        if reported_setpoint == 1:
+            self.target_temperature = self.heating_frost_prevention
+        else:
+            self.target_temperature = reported_setpoint
+
+        if is_slr2:
+            # When user-set OFF, the device reports the frost-protection setpoint.
+            # Restore the pre-off temperature so HA displays and resumes correctly.
+            if self._user_set_off and self._pre_off_temperature is not None:
+                self.target_temperature = self._pre_off_temperature
+            self._suppress_stale_setpoint(data)
+
+        self.preset_mode = self.climate_preset(mode)
+        if mode == "auto":
+            self.hvac_mode = HVACMode.AUTO
+        elif mode == "heat":
+            if data[k.hold] is False and self.show_heating_schedule_mode:
+                self.hvac_mode = HVACMode.AUTO
+            else:
+                self.hvac_mode = HVACMode.HEAT
+        elif mode == "emergency_heating":
+            self.hvac_mode = HVACMode.HEAT
+            self.heat_boost = True
+        elif mode == "off":
+            self.hvac_mode = HVACMode.OFF
+        if is_slr2 and self._user_set_off:
+            self.hvac_mode = HVACMode.OFF
+
+        # The SLR2 fakes OFF with frost protection, so never record OFF as pre-boost
+        if mode != "emergency_heating" and not (
+            is_slr2 and self.hvac_mode == HVACMode.OFF
+        ):
+            self.pre_boost_occupied_heating_setpoint_heat = self.target_temperature
+            self.pre_boost_hvac_mode = self.hvac_mode
+
+        return remaining, reported_setpoint
+
+    def _suppress_stale_setpoint(self, data: dict[str, Any]) -> None:
+        """Guard against the SLR2 schedule-transition race condition.
+
+        When the SLR2 transitions schedule periods it emits a burst of MQTT
+        messages. The genuine new setpoint arrives with hold=False; stale
+        echoes of the prior period's setpoint arrive with hold=True.
+        Strategy: track the last hold=False setpoint as the authoritative
+        target, and suppress any hold=True message that differs from it.
+        This catches echoes at any temperature (7°C frost, 19°C prior
+        setpoint, etc.) not just frost-level values.
+        Skip suppression when the user intentionally set OFF via HA -
+        that command also uses hold=True and must not be overridden.
+        """
+        hold = data.get(self.heat_keys.hold)
+        if hold is False:
+            # Genuine schedule setpoint - record it as the authoritative target.
+            self._last_schedule_setpoint = self.target_temperature
+        elif (
+            not self._user_set_off
+            and hold is True
+            and self._last_schedule_setpoint is not None
+            and self.target_temperature != self._last_schedule_setpoint
+        ):
+            LOGGER.warning(
+                "Suppressing stale setpoint echo during schedule transition "
+                "(ignoring %.1f°C, retaining %.1f°C)",
+                self.target_temperature,
+                self._last_schedule_setpoint,
+            )
+            self.target_temperature = self._last_schedule_setpoint
+
+    def _parse_water(self, data: dict[str, Any]) -> int:
+        """Update SLR2 water state from a payload, returning boost remaining."""
+        k = self.water_keys
+        mode = data[k.mode]
+
+        remaining = cast(
+            int, data[k.hold_duration] if mode == "emergency_heating" else 0
+        )
+        self.running_state_water = cast(str, data.get(k.running_state) or "preheating")
+
+        if mode == "auto":
+            self.water_mode = "auto"
+        elif mode == "heat":
+            if data[k.hold] is False and self.show_water_schedule_mode:
+                self.water_mode = "auto"
+            else:
+                self.water_mode = "heat"
+        elif mode == "emergency_heating":
+            self.water_mode = "boost"
+            self.water_boost = True
+        elif mode == "off":
+            self.water_mode = "off"
+
+        if mode != "emergency_heating":
+            self.pre_boost_water_mode = self.water_mode
+
+        return remaining
 
     def valid_data_for_model(self, data: dict[str, Any]) -> bool:
         """Check if data is valid for the current model."""
