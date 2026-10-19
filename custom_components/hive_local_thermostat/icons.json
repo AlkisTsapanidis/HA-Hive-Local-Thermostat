@@ -42,6 +42,12 @@
       "boost_remaining_water": {
         "default": "mdi:timer-outline"
       },
+      "heat_boost_end": {
+        "default": "mdi:timer-sand"
+      },
+      "water_boost_end": {
+        "default": "mdi:timer-sand"
+      },
       "local_temperature_heat": {
         "default": "mdi:thermometer"
       },

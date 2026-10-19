@@ -76,6 +76,18 @@ async def async_setup_entry(
                 translation_key="boost_remaining_water",
                 name=config_entry.title,
             ),
+            HiveSensorEntityDescription(
+                key="heat_boost_end",
+                translation_key="heat_boost_end",
+                name=config_entry.title,
+                device_class=SensorDeviceClass.TIMESTAMP,
+            ),
+            HiveSensorEntityDescription(
+                key="water_boost_end",
+                translation_key="water_boost_end",
+                name=config_entry.title,
+                device_class=SensorDeviceClass.TIMESTAMP,
+            ),
         ]
     else:
         entity_descriptions = [
@@ -97,6 +109,12 @@ async def async_setup_entry(
                 translation_key="boost_remaining_heat",
                 name=config_entry.title,
                 suggested_display_precision=1,
+            ),
+            HiveSensorEntityDescription(
+                key="heat_boost_end",
+                translation_key="heat_boost_end",
+                name=config_entry.title,
+                device_class=SensorDeviceClass.TIMESTAMP,
             ),
         ]
 
@@ -139,6 +157,8 @@ class HiveSensor(HiveEntity, SensorEntity):
         except AttributeError:
             if self.entity_description.device_class == SensorDeviceClass.TEMPERATURE:
                 new_value = 0
+            elif self.entity_description.device_class == SensorDeviceClass.TIMESTAMP:
+                new_value = None
             else:
                 new_value = ""
 

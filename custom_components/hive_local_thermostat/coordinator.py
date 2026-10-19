@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, cast
 
 from homeassistant.components.climate.const import (
@@ -37,6 +37,8 @@ PRESET_MAP = {
 }
 
 BOOST_ERROR = 65000
+# The device reports whole minutes remaining, so allow for that rounding
+BOOST_END_TOLERANCE = 120
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,8 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     water_boost_started_duration: int = 0
     heat_boost_remaining: int = 0
     water_boost_remaining: int = 0
+    heat_boost_end: datetime | None = None
+    water_boost_end: datetime | None = None
 
     pre_boost_hvac_mode: HVACMode | None = None
     pre_boost_occupied_heating_setpoint_heat: float | None = None
@@ -448,8 +452,28 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.water_boost_remaining = reported_boost_remaining_water
         return False
 
+    @staticmethod
+    def _boost_end(
+        active: bool,  # noqa: FBT001
+        remaining_minutes: int,
+        current: datetime | None,
+    ) -> datetime | None:
+        """Return the boost end time, ignoring per-minute drift in the reported remainder."""
+        if not active or remaining_minutes <= 0:
+            return None
+        candidate: datetime = utcnow() + timedelta(minutes=remaining_minutes)
+        if (
+            current is not None
+            and abs((candidate - current).total_seconds()) <= BOOST_END_TOLERANCE
+        ):
+            return current
+        return candidate
+
     def record_heat_boost_state(self) -> None:
         """Record and track boost state for heating."""
+        self.heat_boost_end = self._boost_end(
+            self.heat_boost, self.heat_boost_remaining, self.heat_boost_end
+        )
         if self.heat_boost and self.heat_boost_remaining > 0:
             # Boost is active, record the start time if not already recorded
             if not self.heat_boost_started:
@@ -472,6 +496,9 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def record_water_boost_state(self) -> None:
         """Record and track boost state for water."""
+        self.water_boost_end = self._boost_end(
+            self.water_boost, self.water_boost_remaining, self.water_boost_end
+        )
         if self.water_boost and self.water_boost_remaining > 0:
             # Water boost is active, record the start time if not already recorded
             if not self.water_boost_started:

@@ -84,6 +84,12 @@
             "boost_remaining_water": {
                 "name": "Water boost remaining",
                 "unit_of_measurement": "minutes"
+            },
+            "heat_boost_end": {
+                "name": "Heating boost end"
+            },
+            "water_boost_end": {
+                "name": "Water boost end"
             }
         },
         "climate": {
