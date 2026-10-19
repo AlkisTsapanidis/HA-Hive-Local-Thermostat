@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
 
@@ -36,6 +37,37 @@ PRESET_MAP = {
 }
 
 BOOST_ERROR = 65000
+
+
+@dataclass(frozen=True)
+class ZoneKeys:
+    """Zigbee2MQTT attribute names for one heating/water zone."""
+
+    mode: str
+    hold: str
+    hold_duration: str
+    setpoint: str = ""  # unused for water, which has no setpoint attribute
+
+
+# SLR1/OTR1 expose a single heating zone with unsuffixed attribute names
+HEAT_KEYS_SINGLE = ZoneKeys(
+    mode="system_mode",
+    hold="temperature_setpoint_hold",
+    hold_duration="temperature_setpoint_hold_duration",
+    setpoint="occupied_heating_setpoint",
+)
+# SLR2 suffixes its attributes per zone
+HEAT_KEYS_SLR2 = ZoneKeys(
+    mode="system_mode_heat",
+    hold="temperature_setpoint_hold_heat",
+    hold_duration="temperature_setpoint_hold_duration_heat",
+    setpoint="occupied_heating_setpoint_heat",
+)
+WATER_KEYS_SLR2 = ZoneKeys(
+    mode="system_mode_water",
+    hold="temperature_setpoint_hold_water",
+    hold_duration="temperature_setpoint_hold_duration_water",
+)
 
 
 class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -97,6 +129,8 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.entry_id = entry_id
         self.model = model
+        self.heat_keys = HEAT_KEYS_SLR2 if model == MODEL_SLR2 else HEAT_KEYS_SINGLE
+        self.water_keys = WATER_KEYS_SLR2
         self.topic = topic
         self.show_heating_schedule_mode = show_heat_schedule_mode
         self.show_water_schedule_mode = show_water_schedule_mode
@@ -481,10 +515,11 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.water_boost_started = None
             self.water_boost_started_duration = 0
 
-    async def _async_publish_set(self, payload: str) -> None:
+    async def _async_publish_set(self, payload: dict[str, Any]) -> None:
         """Publish MQTT set message."""
-        LOGGER.debug("Sending to %s message %s", self.topic_set, payload)
-        await mqtt_client.async_publish(self.hass, self.topic_set, payload)
+        message = json.dumps(payload)
+        LOGGER.debug("Sending to %s message %s", self.topic_set, message)
+        await mqtt_client.async_publish(self.hass, self.topic_set, message)
 
     async def async_water_boost(
         self, boost_duration_minutes: int | None = None
@@ -494,18 +529,16 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not self.water_boost:
             self.pre_boost_water_mode = self.water_mode
 
-        duration = str(int(boost_duration_minutes or self.water_boost_duration))
-        payload = (
-            r'{"system_mode_water":"emergency_heating","temperature_setpoint_hold_duration_water":'
-            + duration
-            + r',"temperature_setpoint_hold_water":1}'
-        )
+        duration = int(boost_duration_minutes or self.water_boost_duration)
+        k = self.water_keys
 
         self.water_boost = True
         self.water_boost_started = utcnow()
-        self.water_boost_started_duration = int(duration)
+        self.water_boost_started_duration = duration
 
-        await self._async_publish_set(payload)
+        await self._async_publish_set(
+            {k.mode: "emergency_heating", k.hold_duration: duration, k.hold: 1}
+        )
 
     async def async_water_boost_cancel(self) -> None:
         """Cancel water boost command."""
@@ -520,20 +553,19 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_water_scheduled(self) -> None:
         """Send water scheduled command."""
 
-        payload = r'{"system_mode_water":"auto"}'
-        await self._async_publish_set(payload)
+        await self._async_publish_set({self.water_keys.mode: "auto"})
 
     async def async_water_always_on(self) -> None:
         """Send water always on command."""
 
-        payload = r'{"system_mode_water":"heat","temperature_setpoint_hold_water":1}'
-        await self._async_publish_set(payload)
+        k = self.water_keys
+        await self._async_publish_set({k.mode: "heat", k.hold: 1})
 
     async def async_water_always_off(self) -> None:
         """Send water always off command."""
 
-        payload = r'{"system_mode_water":"off","temperature_setpoint_hold_water":0}'
-        await self._async_publish_set(payload)
+        k = self.water_keys
+        await self._async_publish_set({k.mode: "off", k.hold: 0})
 
     async def async_heating_boost(
         self,
@@ -548,52 +580,38 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.pre_boost_occupied_heating_setpoint_heat = self.target_temperature
             self.pre_boost_hvac_mode = self.hvac_mode
 
-        duration = str(int(boost_duration_minutes or self.heating_boost_duration))
-        temperature = str(boost_temperature or self.heating_boost_temperature)
-
-        if self.model == MODEL_SLR2:
-            payload = (
-                r'{"system_mode_heat":"emergency_heating","temperature_setpoint_hold_duration_heat":'
-                + duration
-                + r',"temperature_setpoint_hold_heat":1,"occupied_heating_setpoint_heat":'
-                + temperature
-                + r"}"
-            )
-        else:
-            payload = (
-                r'{"system_mode":"emergency_heating","temperature_setpoint_hold_duration":'
-                + duration
-                + r',"temperature_setpoint_hold":1,"occupied_heating_setpoint":'
-                + temperature
-                + r"}"
-            )
+        duration = int(boost_duration_minutes or self.heating_boost_duration)
+        temperature = boost_temperature or self.heating_boost_temperature
+        k = self.heat_keys
 
         self.heat_boost = True
         self.heat_boost_started = utcnow()
-        self.heat_boost_started_duration = int(duration)
+        self.heat_boost_started_duration = duration
 
-        await self._async_publish_set(payload)
+        await self._async_publish_set(
+            {
+                k.mode: "emergency_heating",
+                k.hold_duration: duration,
+                k.hold: 1,
+                k.setpoint: temperature,
+            }
+        )
 
     async def async_heating_boost_cancel(self) -> None:
         """Cancel heating boost command."""
 
-        if self.pre_boost_hvac_mode == HVACMode.AUTO:
-            if self.model == MODEL_SLR2:
-                await self._async_publish_set(r'{"system_mode_heat":"heat","temperature_setpoint_hold_heat":0}')
-            else:
-                await self._async_publish_set(r'{"system_mode":"heat","temperature_setpoint_hold":0}')
-        elif self.pre_boost_hvac_mode == HVACMode.HEAT:
-            if self.model == MODEL_SLR2:
-                await self._async_publish_set(r'{"system_mode_heat":"heat","temperature_setpoint_hold_heat":0}')
-            else:
-                await self._async_publish_set(r'{"system_mode":"heat","temperature_setpoint_hold":0}')
-        else:
-            if self.model == MODEL_SLR2:
-                await self._async_publish_set(r'{"system_mode_heat":"off","temperature_setpoint_hold_heat":0}')
-            else:
-                # Cancelling a boost in the SLR1 while the system is in manual mode actually reverts to the schedule.
-                # This basically maintains that behaviour for consistency. I cannot verify what the SLR2 does.
-                await self._async_publish_set(r'{"system_mode":"heat","temperature_setpoint_hold":0}')
+        k = self.heat_keys
+
+        # Cancelling a boost in the SLR1 while the system is in manual mode actually reverts to the schedule.
+        # This basically maintains that behaviour for consistency. I cannot verify what the SLR2 does.
+        mode = "heat"
+        if (
+            self.pre_boost_hvac_mode not in (HVACMode.AUTO, HVACMode.HEAT)
+            and self.model == MODEL_SLR2
+        ):
+            mode = "off"
+
+        await self._async_publish_set({k.mode: mode, k.hold: 0})
 
     async def async_set_temperature(self, temperature: float) -> None:
         """Set temperature."""
@@ -605,29 +623,26 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._pre_off_temperature = temperature
             return
 
-        if self.model == MODEL_SLR2:
-            payload = r'{"occupied_heating_setpoint_heat":' + str(temperature) + r"}"
-        else:
-            payload = r'{"occupied_heating_setpoint":' + str(temperature) + r"}"
-
         # If the user changes the setpoint while off (SLR1/OTR1), track it as the new resume temperature
         if self._user_set_off:
             self._pre_off_temperature = temperature
 
-        await self._async_publish_set(payload)
+        await self._async_publish_set({self.heat_keys.setpoint: temperature})
 
     async def async_set_hvac_mode_off(self) -> None:
         """Set HVAC mode to off."""
 
+        k = self.heat_keys
+        payload: dict[str, Any]
         if self.model == MODEL_SLR2:
-            payload = (
-                r'{"system_mode_heat":"heat","temperature_setpoint_hold_heat":true'
-                r',"occupied_heating_setpoint_heat":'
-                + str(FROST_PROTECTION_SETPOINT)
-                + r"}"
-            )
+            # SLR2 has no usable "off" for heating; hold frost protection instead
+            payload = {
+                k.mode: "heat",
+                k.hold: True,
+                k.setpoint: FROST_PROTECTION_SETPOINT,
+            }
         else:
-            payload = r'{"system_mode":"off","temperature_setpoint_hold":false}'
+            payload = {k.mode: "off", k.hold: False}
 
         # Save the current setpoint so it can be restored when turning back on
         if self.target_temperature is not None:
@@ -639,14 +654,9 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_set_hvac_mode_auto(self) -> None:
         """Set HVAC mode to auto."""
 
-        if self.model == MODEL_SLR2:
-            payload = r'{"system_mode_heat":"auto"}'
-        else:
-            payload = r'{"system_mode":"auto"}'
-
         self._user_set_off = False
         self.hvac_mode = HVACMode.AUTO
-        await self._async_publish_set(payload)
+        await self._async_publish_set({self.heat_keys.mode: "auto"})
 
     async def async_set_hvac_mode_heat(
         self,
@@ -655,20 +665,15 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> None:
         """Set HVAC mode to heat."""
 
-        if self.model == MODEL_SLR2:
-            payload = (
-                r'{"system_mode_heat":"heat","occupied_heating_setpoint_heat":'
-                + str(temperature)
-                + r',"temperature_setpoint_hold_heat":true,"temperature_setpoint_hold_duration_heat":0}'
-            )
-        else:
-            payload = (
-                r'{"system_mode":"heat","occupied_heating_setpoint":'
-                + str(temperature)
-                + r',"temperature_setpoint_hold":true,"temperature_setpoint_hold_duration":0}'
-            )
-
+        k = self.heat_keys
         self._user_set_off = False
         self._pre_off_temperature = None
         self.hvac_mode = HVACMode.HEAT
-        await self._async_publish_set(payload)
+        await self._async_publish_set(
+            {
+                k.mode: "heat",
+                k.setpoint: temperature,
+                k.hold: True,
+                k.hold_duration: 0,
+            }
+        )
