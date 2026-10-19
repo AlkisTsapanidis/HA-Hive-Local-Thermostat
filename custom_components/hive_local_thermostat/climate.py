@@ -13,6 +13,7 @@ from homeassistant.components.climate import (
     ClimateEntity,
     ClimateEntityDescription,
     ClimateEntityFeature,
+    HVACAction,
     HVACMode,
 )
 from homeassistant.const import (
@@ -60,13 +61,24 @@ async def async_setup_entry(
         name=config_entry.title,
     )
 
-    _entities = [
-        HiveClimateEntity(
-            entity_description=hive_climate_entity_description, coordinator=coordinator
-        )
-    ]
+    hive_boost_entity_description = HiveClimateEntityDescription(
+        key="boost_climate",
+        translation_key="boost_climate",
+        name=config_entry.title,
+    )
 
-    async_add_entities(climateEntity for climateEntity in _entities)
+    async_add_entities(
+        [
+            HiveClimateEntity(
+                entity_description=hive_climate_entity_description,
+                coordinator=coordinator,
+            ),
+            HiveBoostClimateEntity(
+                entity_description=hive_boost_entity_description,
+                coordinator=coordinator,
+            ),
+        ]
+    )
 
 
 class HiveClimateEntity(HiveEntity, ClimateEntity):
@@ -244,4 +256,104 @@ class HiveClimateEntity(HiveEntity, ClimateEntity):
         self._attr_hvac_mode = self.coordinator.hvac_mode
 
         # Update HA state
+        self.async_write_ha_state()
+
+
+class HiveBoostClimateEntity(HiveEntity, ClimateEntity):
+    """Thermostat whose target temperature is the boost temperature.
+
+    HEAT starts a boost and OFF cancels it, so boost can be driven from
+    thermostat-only frontends such as the HomeKit bridge.
+    """
+
+    entity_description: HiveClimateEntityDescription
+
+    def __init__(
+        self,
+        entity_description: HiveClimateEntityDescription,
+        coordinator: HiveCoordinator,
+    ) -> None:
+        """Initialize the boost climate class."""
+
+        self.entity_description = entity_description
+        self._attr_unique_id = (
+            f"{DOMAIN}_{entity_description.name}_{entity_description.key}".lower()
+        )
+        self._attr_has_entity_name = True
+
+        self._attr_temperature_unit = UnitOfTemperature.CELSIUS
+        self._attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT]
+        self._attr_hvac_mode = HVACMode.OFF
+        self._attr_supported_features = (
+            ClimateEntityFeature.TURN_OFF
+            | ClimateEntityFeature.TURN_ON
+            | ClimateEntityFeature.TARGET_TEMPERATURE
+        )
+        self._attr_max_temp = 32
+        self._attr_min_temp = 12
+        self._attr_target_temperature_step = 0.5
+
+        super().__init__(entity_description, coordinator)
+
+    @property
+    def current_temperature(self) -> float | None:
+        """Return the room temperature."""
+        return self.coordinator.current_temperature
+
+    @property
+    def target_temperature(self) -> float | None:
+        """Return the configured boost temperature."""
+        return self.coordinator.heating_boost_temperature
+
+    @property
+    def hvac_action(self) -> HVACAction | None:
+        """Return the action, which is only active while boosting."""
+        if self._attr_hvac_mode == HVACMode.OFF:
+            return HVACAction.OFF
+        return self.coordinator.hvac_action
+
+    async def async_set_temperature(self, **kwargs: Any) -> None:
+        """Set the boost temperature, restarting an active boost with it."""
+        temperature = kwargs.get(ATTR_TEMPERATURE)
+        if temperature:
+            self.coordinator.heating_boost_temperature = temperature
+            # Let the boost temperature number entity pick up the new value
+            self.coordinator.async_update_listeners()
+
+        hvac_mode = kwargs.get(ATTR_HVAC_MODE)
+        if hvac_mode:
+            await self.async_set_hvac_mode(hvac_mode)
+        elif temperature and self._attr_hvac_mode == HVACMode.HEAT:
+            await self.coordinator.async_heating_boost()
+
+        self.async_write_ha_state()
+
+    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        """Start (HEAT) or cancel (OFF) the heating boost."""
+        if hvac_mode == HVACMode.HEAT:
+            await self.coordinator.async_heating_boost()
+        elif hvac_mode == HVACMode.OFF:
+            if self._attr_hvac_mode == HVACMode.HEAT:
+                await self.coordinator.async_heating_boost_cancel()
+        else:
+            LOGGER.error("Unrecognized hvac mode: %s", hvac_mode)
+            return
+
+        self._attr_hvac_mode = hvac_mode
+        self.async_write_ha_state()
+
+    async def async_turn_on(self) -> None:
+        """Start the boost."""
+        await self.async_set_hvac_mode(HVACMode.HEAT)
+
+    async def async_turn_off(self) -> None:
+        """Cancel the boost."""
+        await self.async_set_hvac_mode(HVACMode.OFF)
+
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+
+        self._attr_hvac_mode = (
+            HVACMode.HEAT if self.coordinator.heat_boost else HVACMode.OFF
+        )
         self.async_write_ha_state()

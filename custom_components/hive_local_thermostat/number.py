@@ -176,6 +176,8 @@ class HiveNumber(HiveEntity, RestoreNumber):
 
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        # Number entities don't need to process MQTT data updates
-        # They only update through user input
+        # Other entities (e.g. the boost thermostat) may change the stored value
+        self._state = getattr(
+            self.coordinator, self.entity_description.key, self._state
+        )
         self.async_write_ha_state()

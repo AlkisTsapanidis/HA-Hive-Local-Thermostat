@@ -89,6 +89,9 @@
         "climate": {
             "climate": {
                 "name": "Climate"
+            },
+            "boost_climate": {
+                "name": "Boost"
             }
         },
         "select": {
