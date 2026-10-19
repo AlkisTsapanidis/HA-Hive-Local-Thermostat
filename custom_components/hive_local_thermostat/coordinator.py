@@ -552,17 +552,24 @@ class HiveCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_heating_boost_cancel(self) -> None:
         """Cancel heating boost command."""
 
+    async def async_heating_boost_cancel(self) -> None:
+        """Cancel heating boost command."""
+
         if self.pre_boost_hvac_mode == HVACMode.AUTO:
-            await self.async_set_hvac_mode_auto()
-        elif self.pre_boost_hvac_mode == HVACMode.HEAT:
-            if self.pre_boost_occupied_heating_setpoint_heat is not None:
-                await self.async_set_hvac_mode_heat(
-                    self.pre_boost_occupied_heating_setpoint_heat
-                )
+            if self.model == MODEL_SLR2:
+                await self._async_publish_set(r'{"system_mode_heat":"heat","temperature_setpoint_hold_heat":0}')
             else:
-                await self.async_set_hvac_mode_heat(self.heating_frost_prevention)
+                await self._async_publish_set(r'{"system_mode":"heat","temperature_setpoint_hold":0}')
+        elif self.pre_boost_hvac_mode == HVACMode.HEAT:
+            if self.model == MODEL_SLR2:
+                await self._async_publish_set(r'{"system_mode_heat":"heat","temperature_setpoint_hold_heat":0}')
+            else:
+                await self._async_publish_set(r'{"system_mode":"heat","temperature_setpoint_hold":0}')
         else:
-            await self.async_set_hvac_mode_off()
+            if self.model == MODEL_SLR2:
+                await self._async_publish_set(r'{"system_mode_heat":"off","temperature_setpoint_hold_heat":0}')
+            else:
+                await self._async_publish_set(r'{"system_mode":"heat","temperature_setpoint_hold":0}')
 
     async def async_set_temperature(self, temperature: float) -> None:
         """Set temperature."""
